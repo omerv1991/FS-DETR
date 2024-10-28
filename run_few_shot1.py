@@ -15,32 +15,38 @@ from selective_search import selective_search
 
 from few_shots_utils_detection import (CocoDetectionDataset,WarmUpScheduler,GetSystemData,MultiEpochsDataLoader,LoadModel,compute_iou,generalized_box_iou_loss,ObjectDetectionAugmentation)
 from few_shots_network import FewShotNetwork
-# Define the root directory where images are stored and the path to the annotation file
-TrainDir = 'F:\\coco\\train2017\\'
-TrainAnnotations = 'F:\\coco\\annotations\\instances_train2017.json'
+import yaml
 
-#PreTrainDir = 'F:\ImageNet\imagenet100\val.X'
-PreTrainDir = 'F:\\ImageNet\\imagenet100\\train.X2\\n01514668'
-#PreTrainAnnotations = 'F:\\ImageNet\\annotations\\'
 
-TestDir = 'F:\\coco\\val2017\\'
-TestAnnotations = 'F:\\coco\\annotations\\instances_val2017.json'
 
-# filters only per% from data: #per = 2
-# fixme add as hyper parameter in YAML file 2
-per = 1
+# Load the YAML file
+with open('config.yml', 'r') as file:
+    config = yaml.safe_load(file)
+    # Define the root directory where images are stored and the path to the annotation file
+    TrainDir = config["paths"]["TrainDir"]
+    TrainAnnotations = config["paths"]["TrainAnnotations"]
+    PreTrainDir = config["paths"]["PreTrainDir"]
+    TestDir = config["paths"]["TestDir"]
+    TestAnnotations = config["paths"]["TestAnnotations"]
+    # Training parameters
+    per = config["training"]["per"] # percentages of the dataset to be used for training
+    loss_flag = config["training_parameters"]["loss_flag"]
+    VisualPrompt_flag = config["training_parameters"]["VisualPrompt_flag"]
 
 if __name__ == '__main__':
     GetSystemData()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     NumGpus = torch.cuda.device_count()
+    #fixme debug the over-heating GPU
+    NumGpus = 1
     torch.cuda.empty_cache()
     GPUtil.showUtilization()
 
     ModelsDirName = './models1/'
     LogsDirName = './logs1/'
     Description = 'DeepAge'
-    BestFileName = 'detection_best73'
+    #BestFileName = 'detection_best73'
+    BestFileName = 'detection263'
     FileName = 'detection'
     now = datetime.datetime.now()
     date_time_str = now.strftime("%Y-%m-%d_%H-%M")
@@ -86,7 +92,7 @@ if __name__ == '__main__':
 
     bce_loss = nn.BCEWithLogitsLoss()
 
-    net = FewShotNetwork()
+    net = FewShotNetwork(VisualPrompt_flag=VisualPrompt_flag)
 
     StartEpoch = 0
     HighestACC = -1e10
@@ -158,7 +164,7 @@ if __name__ == '__main__':
             pos_class_loss  = bce_loss(PosClass, torch.ones(PosClass.shape[0]).to(PosClass.device))
             neg_class_loss  = bce_loss(NegClass, torch.zeros(NegClass.shape[0]).to(NegClass.device))
 
-            #todo omer - check if 0 should be changed to 0.5
+            #tikun- in case of adding another activation function in the forward pass- change the 0 threshold to 0.5
             running_class_acc += ((PosClass > 0).sum() + (NegClass<0).sum()).item()/(PosClass.shape[0]+NegClass.shape[0])
             short_running_class_acc += ((PosClass > 0).sum() + (NegClass<0).sum()).item()/(PosClass.shape[0]+NegClass.shape[0])
 
@@ -174,8 +180,8 @@ if __name__ == '__main__':
             bbox_loss *= 1
 
             #loss = pos_class_loss+neg_class_loss+bbox_loss
-            # fixme - add flag for objective with / without confidence output
-            loss = bbox_loss
+            if loss_flag == "BBox only":
+                loss = bbox_loss
 
 
 
@@ -215,7 +221,10 @@ if __name__ == '__main__':
         if Mode == 'Test':
 
             WarmUpSched.step()
-            CurrentACC=running_class_acc/batch
+            if batch ==0:
+                CurrentACC= running_class_acc
+            else:
+                CurrentACC = running_class_acc / batch
             if CurrentACC > HighestACC:
                 ss=0
             scheduler.step(metrics=TotalLoss.item())

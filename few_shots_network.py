@@ -62,16 +62,14 @@ class PositionalEncoding2D(nn.Module):
 
 
     def forward(self, x):
-        return x+self.pe2d[None,:,:,:orig_ch]
-
-
-
-
+        #return x+self.pe2d[None,:,:,:orig_ch]
+        #fixme what is it for?
+        return x+self.pe2d[None,:,:,:self.channels_no]
 
 
 
 class FewShotNetwork(nn.Module):
-    def __init__(self,p=0.2):
+    def __init__(self,p=0.2,VisualPrompt_flag=False,object_embeddings_size=5):
         super(FewShotNetwork, self).__init__()
         # Load a pre-trained MViT model from the timm library
         #print(timm.list_models())
@@ -83,8 +81,9 @@ class FewShotNetwork(nn.Module):
         #self.backbone = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         #self.backbone  = self.backbone.features[:-5]
         #self.backbone = self.backbone.features[:-3]
-
+        self.object_embeddings_size = object_embeddings_size
         d_model=1024
+        self.d_model = d_model
         self.LayerNorm1 = nn.LayerNorm(d_model)
         self.LayerNorm2 = nn.LayerNorm(d_model)
         self.LayerNorm3 = nn.LayerNorm(d_model)
@@ -94,9 +93,11 @@ class FewShotNetwork(nn.Module):
         #d_model=176
         Poss2D=PositionalEncoding2D(channels_no=d_model, max_height=256, max_width=256)
         self.PositionalEncoding2D = Poss2D.pe2d.permute(2, 0, 1)
-
-        self.HEAD_embedding = nn.Embedding(num_embeddings=5, embedding_dim=d_model)
-        self.HEAD_embedding = nn.Parameter(F.normalize(torch.randn(5, d_model), dim=1))
+        self.HEAD_embedding = nn.Embedding(num_embeddings=self.object_embeddings_size, embedding_dim=d_model)
+        self.HEAD_embedding = nn.Parameter(F.normalize(torch.randn(self.object_embeddings_size, d_model), dim=1))
+        k_shot = 1
+        query_dim = 64
+        self.pseudo_class_embedding = nn.Parameter(F.normalize(torch.randn(k_shot,query_dim, d_model), dim=1))
 
         nhead = 2
         num_layers = 2
@@ -114,6 +115,7 @@ class FewShotNetwork(nn.Module):
         nhead = 4
         num_layers = 4
         dim_feedforward = 1024
+        self.VisualPrompt_flag = VisualPrompt_flag
         #decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=0.1)
         #self.transformer_decoder_regression_head = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
@@ -124,7 +126,7 @@ class FewShotNetwork(nn.Module):
         self.BBOX_head1 = nn.Linear(d_model, d_model)
         self.BBOX_head2 = nn.Linear(d_model, d_model)
         self.BBOX_head3 = nn.Linear(d_model, 1)
-
+        # p = dropout rate
         self.dropout1 = nn.Dropout(p=p)
         self.dropout2 = nn.Dropout(p=p)
         self.dropout3 = nn.Dropout(p=p)
@@ -177,12 +179,24 @@ class FewShotNetwork(nn.Module):
         Query = Query.reshape(Query.size(0), Query.size(1), -1).permute(2, 0, 1)
 
         TargetPE = TargetPE.reshape(TargetPE.size(0), TargetPE.size(1), -1).permute(2, 0, 1)
+        #fixme should i use is? what for?
         QueryPE = QueryPE.reshape(QueryPE.size(0), QueryPE.size(1), -1).permute(2, 0, 1)
 
         # Target = self.transformer_encoder(src=Target)
         # Query  = self.transformer_encoder(src=Query, src_key_padding_mask=memory_key_padding_mask)
 
-        TransTarget = self.transformer_decoder_4DCV(tgt=Target, memory=Query)
+        if self.VisualPrompt_flag:
+            # use the pseudo class embedding
+            batch_size = Query.shape[1]
+            pseudo_class_embedding = self.pseudo_class_embedding.unsqueeze(1).repeat(1,batch_size,1, 1).permute(0,2,1,3)
+            # in case k=1 -> else- use .repeat?
+            pseudo_class_embedding = pseudo_class_embedding.squeeze(0).to(Query.device)
+            # create the visual prompt
+            visual_prompt = Query + pseudo_class_embedding
+            TransTarget = self.transformer_decoder_4DCV(tgt=Target, memory=visual_prompt)
+
+        else:
+            TransTarget = self.transformer_decoder_4DCV(tgt=Target, memory=Query)
 
         if TransTarget.isnan().any():
             print("nan in TransTarget")
@@ -196,9 +210,17 @@ class FewShotNetwork(nn.Module):
 
         self.HEAD_embedding.data = F.normalize(self.HEAD_embedding.data, dim=1)
         HeadQuery = self.HEAD_embedding.unsqueeze(1).repeat(1, TransTarget.shape[1], 1, )
-        # todo - why only 5? whats the role of it?
-        PosResultsDetect = self.transformer_decoder_detection_head(tgt=HeadQuery[0:5, :], memory=TransTarget)
-        NegResultsDetect = self.transformer_decoder_detection_head(tgt=HeadQuery[0:5, :], memory=NegativeTransTarget)
+
+        if self.VisualPrompt_flag:
+            pass
+            # concat with the object query ; HeadQuery is the object_queries
+            concatenated_queries = torch.cat((HeadQuery, visual_prompt), dim=0)
+            # fixme since trans target has only 5 queries (1st for classify and rest for bbox) PCE be implemented!
+            #self.object_embeddings_size = 69
+            #HeadQuery = concatenated_queries
+
+        PosResultsDetect = self.transformer_decoder_detection_head(tgt=HeadQuery[0:self.object_embeddings_size, :], memory=TransTarget)
+        NegResultsDetect = self.transformer_decoder_detection_head(tgt=HeadQuery[0:self.object_embeddings_size, :], memory=NegativeTransTarget)
 
         PosResultsDetect = self.LayerNorm3(PosResultsDetect)
         NegResultsDetect = self.LayerNorm3(NegResultsDetect)
@@ -225,7 +247,8 @@ class FewShotNetwork(nn.Module):
         NegClass = self.dropout2(NegClass)
         NegClass = self.Class_head3(NegClass).squeeze()
 
-        PosBbox = self.BBOX_head1(PosResultsDetect[1:5, ]).squeeze()
+        PosBbox = self.BBOX_head1(PosResultsDetect[1:self.object_embeddings_size, ]).squeeze()
+
         # PosBbox = self.BBOX_head1(PosResultsRegress).squeeze()
         PosBbox = torch.nn.functional.relu(PosBbox)
         # PosBbox = self.BBOX_head2(PosBbox).squeeze()
